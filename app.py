@@ -4,6 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import plotly.express as px
 from datetime import datetime
+import re
 
 st.set_page_config(page_title="Sheets + Streamlit Demo", page_icon="🗂️", layout="centered")
 
@@ -30,11 +31,50 @@ worksheet_name = st.secrets.get("worksheet_name", "Sheet1")
 
 ws = client.open_by_key(sheet_id).worksheet(worksheet_name)
 
+# --- Helpers ---
+def extract_first_number(x):
+    """Return first numeric value found in a string/cell, else NaN."""
+    if pd.isna(x):
+        return pd.NA
+    s = str(x).strip()
+    if s == "" or s.lower() in {"na", "n/a", "none", "-", "--"}:
+        return pd.NA
+    s = s.replace(",", "")  # remove thousands separators
+    m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+    return float(m.group(1)) if m else pd.NA
+
+def coerce_intake_columns(df: pd.DataFrame):
+    """
+    Find columns likely representing intake (Bottle/NG) and coerce them to numeric
+    by extracting numbers from strings.
+    Returns (df_copy, intake_candidates)
+    """
+    dfx = df.copy()
+    # normalized columns
+    dfx.columns = [c.strip() for c in dfx.columns]
+
+    # any column name mentioning 'bottle' or 'ng'
+    mask = pd.Series(dfx.columns).str.contains(r"\b(bottle|ng)\b", case=False, regex=True)
+    candidates = pd.Series(dfx.columns)[mask].tolist()
+
+    # also include exact common names if present (in case of extra spaces/case)
+    for hard in ["Bottle (ml)", "NG (ml)"]:
+        if hard in dfx.columns and hard not in candidates:
+            candidates.append(hard)
+
+    # Coerce candidate columns to numeric by extracting first number
+    for c in candidates:
+        dfx[c] = dfx[c].apply(extract_first_number).astype("Float64")
+
+    return dfx, candidates
+
 # --- Load data ---
 @st.cache_data(ttl=60)
 def load_df():
     rows = ws.get_all_records()
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
 # Optional: manual refresh
 cols_hdr = st.columns([1, 1, 6])
@@ -45,31 +85,32 @@ with cols_hdr[0]:
 with cols_hdr[1]:
     st.write("")  # spacer
 
-df = load_df()
+df_raw = load_df()
 
 st.subheader("Sheet data")
-if df.empty:
+if df_raw.empty:
     st.info("No rows yet — add one below.")
 else:
-    st.dataframe(df, use_container_width=True, height=400)
+    st.dataframe(df_raw, use_container_width=True, height=400)
 
 # --- Plotly line plot: Time start vs Bottle/NG consumption ---
 st.divider()
 st.subheader("Intake over time")
 
-if df.empty:
+if df_raw.empty:
     st.info("Nothing to plot yet.")
 else:
     time_col_name = "Time start"
-    if time_col_name not in df.columns:
+    if time_col_name not in df_raw.columns:
         st.warning(f'Cannot plot: "{time_col_name}" column not found.')
     else:
-        s = df[time_col_name].astype(str).str.strip()
+        df, auto_candidates = coerce_intake_columns(df_raw)
 
         # 1) Parse "Time start" to datetime
+        s = df[time_col_name].astype(str).str.strip()
         ts = pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
 
-        # Handle HHMM/HMM like "0900" or "900": assume today's date for the x-axis
+        # Handle HHMM/HMM like "0900" or "900": anchor to today's date
         is_hhmm = s.str.fullmatch(r"\d{3,4}")
         if is_hhmm.any():
             today = pd.Timestamp.today().normalize()
@@ -92,55 +133,61 @@ else:
         if plot_df.empty:
             st.warning("No valid times to plot after parsing. Check your 'Time start' values.")
         else:
-            # 2) Auto-detect likely intake columns (bottle / NG), keep numeric ones, let user adjust
-            candidates = []
-            for c in plot_df.columns:
-                if c in ("__time__", time_col_name):
-                    continue
-                # auto-pick if column name mentions 'bottle' or 'ng'
-                if pd.Series([c]).str.contains(r"\b(bottle|ng)\b", case=False, regex=True).any():
-                    candidates.append(c)
+            # 2) Build the set of columns that actually have numeric values after coercion
+            def has_numeric_values(series: pd.Series) -> bool:
+                return pd.to_numeric(series, errors="coerce").notna().sum() > 0
 
-            numeric_cols = [c for c in plot_df.columns if pd.api.types.is_numeric_dtype(plot_df[c])]
-            default_cols = [c for c in candidates if c in numeric_cols]
+            numeric_like_cols = [c for c in plot_df.columns
+                                 if c not in ("__time__", time_col_name) and has_numeric_values(plot_df[c])]
+
+            # Prefer auto-detected Bottle/NG; fall back to any numeric-like columns
+            default_cols = [c for c in auto_candidates if c in numeric_like_cols]
+            if not default_cols and "Bottle (ml)" in numeric_like_cols:
+                default_cols = ["Bottle (ml)"]
+            if not default_cols and "NG (ml)" in numeric_like_cols:
+                default_cols = ["NG (ml)"]
 
             value_cols = st.multiselect(
                 "Intake series to plot",
-                options=numeric_cols,
-                default=default_cols or (numeric_cols[:2] if len(numeric_cols) >= 1 else []),
-                help="Select the numeric columns representing intake amounts (e.g., 'Bottle (ml)', 'NG (ml)').",
+                options=numeric_like_cols,
+                default=default_cols or numeric_like_cols[:2],
+                help="We extract numbers from text (e.g., '120 ml', '1,200'). Choose the series to plot.",
             )
 
             if not value_cols:
-                st.info("Pick one or more numeric intake columns to plot.")
+                st.info("Pick one or more intake columns to plot.")
             else:
                 long_df = (
                     plot_df.sort_values("__time__")
                     .melt(id_vars="__time__", value_vars=value_cols,
                           var_name="Series", value_name="Value")
-                    .dropna(subset=["Value"])
                 )
+                # ensure numeric for plotting
+                long_df["Value"] = pd.to_numeric(long_df["Value"], errors="coerce")
+                long_df = long_df.dropna(subset=["Value"])
 
-                fig = px.line(
-                    long_df,
-                    x="__time__",
-                    y="Value",
-                    color="Series",
-                    markers=True,
-                    labels={"__time__": "Time start", "Value": "Consumption"},
-                )
-                fig.update_layout(
-                    height=360,
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    legend_title_text="",
-                    hovermode="x unified",
-                )
-                fig.update_traces(
-                    mode="lines+markers",
-                    hovertemplate="Time=%{x}<br>%{legendgroup}: %{y}<extra></extra>"
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
+                if long_df.empty:
+                    st.warning("Selected columns contain no numeric values to plot.")
+                else:
+                    fig = px.line(
+                        long_df,
+                        x="__time__",
+                        y="Value",
+                        color="Series",
+                        markers=True,
+                        labels={"__time__": "Time start", "Value": "Consumption"},
+                    )
+                    fig.update_layout(
+                        height=360,
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        legend_title_text="",
+                        hovermode="x unified",
+                    )
+                    fig.update_traces(
+                        mode="lines+markers",
+                        hovertemplate="Time=%{x}<br>%{legendgroup}: %{y}<extra></extra>"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
 # --- Simple append form (optional) ---
 st.divider()
@@ -148,27 +195,26 @@ st.subheader("Add a row")
 
 with st.form("add_row"):
     # Dynamically build inputs from current columns (or example fields if empty)
-    if df.empty:
-        columns = ["Name", "Protein", "Carbs", "Fat", "Label"]
+    if df_raw.empty:
+        columns = ["Time start", "Bottle (ml)", "NG (ml)", "Notes"]
     else:
-        columns = df.columns.tolist()
+        columns = [c.strip() for c in df_raw.columns.tolist()]
 
     inputs = {}
     cols = st.columns(2)
     for i, col in enumerate(columns):
         with cols[i % 2]:
-            # Try to be numeric if current column looks numeric
-            if not df.empty and pd.api.types.is_numeric_dtype(df[col]):
+            # If the column looks like bottle/ng, offer number input; else text
+            if re.search(r"\b(bottle|ng)\b", col, flags=re.I):
                 val = st.number_input(col, value=0.0, step=1.0, format="%.2f")
             else:
-                # If "Time start" and it's empty DataFrame, accept free text (e.g., 0900 or full datetime)
                 val = st.text_input(col, value="")
             inputs[col] = val
 
     submitted = st.form_submit_button("Append row ➕")
     if submitted:
         # Maintain column order when appending
-        values = [inputs[c] for c in columns]
+        values = [inputs.get(c, "") for c in columns]
         ws.append_row(values)  # appends at the bottom
         st.success("Row added!")
         st.cache_data.clear()  # refresh the table
